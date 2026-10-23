@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+outputs/
+runs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+.env
+.env.*
+.DS_Store

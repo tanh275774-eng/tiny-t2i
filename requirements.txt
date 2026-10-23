@@ -1,0 +1,7 @@
+# 先根据服务器驱动安装 CUDA 版 PyTorch >= 2.6，再安装此文件。
+# 这是代码针对的 API 范围，不是已运行验证的环境锁定文件。
+transformers>=4.51.3,<5
+diffusers>=0.35.1,<0.36
+safetensors>=0.4.3
+numpy>=1.26,<3
+Pillow>=10,<12
