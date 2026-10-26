@@ -3,15 +3,18 @@
 import torch
 from torch import nn
 
+from model_cache import resolve_model
+
 DEFAULT_VAE = "stabilityai/sd-vae-ft-mse"
 
 
 class FrozenVAE(nn.Module):
     def __init__(self, model_id=DEFAULT_VAE, revision=None):
         super().__init__()
+        model_path = resolve_model(model_id, revision)
         from diffusers import AutoencoderKL
 
-        self.model = AutoencoderKL.from_pretrained(model_id, revision=revision)
+        self.model = AutoencoderKL.from_pretrained(model_path, local_files_only=True)
         self.model.requires_grad_(False)
         self.model.eval()
         self.scale = self.model.config.scaling_factor

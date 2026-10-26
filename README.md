@@ -89,7 +89,11 @@ conda activate tiny-t2i
 python -m pip install -r requirements.txt
 ```
 
-默认加载 `openai/clip-vit-base-patch32` 和 `stabilityai/sd-vae-ft-mse`。首次需要网络下载；可通过 `--clip-model /path/to/clip`、`--vae-model /path/to/vae` 指定本地模型目录。`HF_HOME` 可以指定允许写入的缓存盘。参数 `--clip-revision` 和 `--vae-revision` 可固定仓库 commit；没有指定时不保证未来从同名仓库拿到的文件永远一致。
+默认加载 `openai/clip-vit-base-patch32` 和 `stabilityai/sd-vae-ft-mse`。训练和推理统一通过 `model_cache.py` 加载：先检查项目根目录的 `model/`，已有完整文件时直接离线使用，不请求远程更新；没有或下载未完成时，默认从 `https://hf-mirror.com` 下载。下载完成后写入文件清单，再次启动会检查文件是否存在及大小是否匹配。仅有空目录不会被当成下载完成。
+
+模型按仓库名和 revision 的哈希分别保存在 `model/<hash>/`；目录中的 `.tiny-t2i-ready.json` 记录来源。`model/` 已加入 `.gitignore`。下载保留 PyTorch 权重、配置和 tokenizer 文件，仓库同时提供 bin/safetensors 时可能下载两种格式。原来用户级 Hugging Face 缓存不会自动搬入这里，因此切换后第一次可能重新下载。
+
+镜像默认生效，也可在启动前显式设置 `export HF_ENDPOINT=https://hf-mirror.com`。外部已有 `HF_ENDPOINT` 会优先保留。仍可用 `--clip-model /path/to/clip`、`--vae-model /path/to/vae` 指定完整本地目录，指定路径只做本地加载。参数 `--clip-revision` 和 `--vae-revision` 可固定仓库 commit；缓存命中后不会检查同名远程分支更新，若要更新模型请指定新的 commit revision。下载失败时保留已下载文件，下次启动会重试。
 
 CLIP 此处只使用文本编码器，不需要 CLIP 图像编码器。为匹配这个英文 CLIP 与合成标签，先用英文提示词。
 
