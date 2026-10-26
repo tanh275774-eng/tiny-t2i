@@ -61,7 +61,7 @@ def main():
     parser.add_argument("--val-samples", type=int, default=128, help="Synthetic shapes only")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--encode-batch-size", type=int, default=8)
-    parser.add_argument("--steps", type=int, default=10000)
+    parser.add_argument("--epochs", type=int, default=40, help="Full passes over the training set")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--depth", type=int, default=6)
@@ -69,7 +69,7 @@ def main():
     parser.add_argument("--patch-size", type=int, default=2)
     parser.add_argument("--cond-drop", type=float, default=0.1)
     parser.add_argument("--precision", choices=["fp32", "bf16"], default="fp32")
-    parser.add_argument("--save-every", type=int, default=1000)
+    parser.add_argument("--save-every-epochs", type=int, default=1, help="Validate and save every N epochs; always save the final epoch")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--clip-model", default=DEFAULT_CLIP)
@@ -78,7 +78,7 @@ def main():
     parser.add_argument("--vae-revision", default=None)
     args = parser.parse_args()
     positive = (args.samples, args.val_samples, args.batch_size, args.encode_batch_size,
-                args.steps, args.save_every, args.log_every, args.image_size,
+                args.epochs, args.save_every_epochs, args.log_every, args.image_size,
                 args.hidden_size, args.depth, args.heads, args.patch_size)
     if min(positive) <= 0 or args.lr <= 0 or not 0 <= args.cond_drop < 1:
         parser.error("Counts/lr must be positive, and cond-drop must be in [0, 1)")
@@ -154,57 +154,78 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     loader = DataLoader(TensorDataset(train_latents, train_labels), batch_size=args.batch_size,
                         shuffle=True, generator=torch.Generator().manual_seed(args.seed))
-    iterator = iter(loader)
+    steps_per_epoch = len(loader)
+    total_steps = args.epochs * steps_per_epoch
     print(f"Trainable DiT parameters: {sum(p.numel() for p in model.parameters()):,}", flush=True)
     print(f"Latents: {tuple(train_latents.shape)}; text bank: {tuple(text_bank.shape)}", flush=True)
 
-    # 4. Rectified Flow / Flow Matching 训练循环。
-    running_loss = 0.0
-    for step in range(1, args.steps + 1):
-        try:
-            clean, labels = next(iterator)
-        except StopIteration:
-            iterator = iter(loader)
-            clean, labels = next(iterator)
-        clean = clean.to(device)
-        noise = torch.randn_like(clean)
-        t = torch.randn(len(clean), device=device).sigmoid()  # logit-normal 时间采样
-        noisy_latent, target_velocity = flow_training_pair(clean, noise, t)
+    print(f"Training: {args.epochs} epochs, {steps_per_epoch} steps/epoch, "
+          f"{total_steps} total steps", flush=True)
 
-        # 一部分样本使用空文本，让模型同时学习无条件预测，推理时才能做 CFG。
-        drop = torch.rand(len(clean)) < args.cond_drop
-        condition_indices = labels.masked_fill(drop, null_index)
-        text = text_bank[condition_indices].to(device)
-        text_mask = mask_bank[condition_indices].to(device)
+    # 4. 每轮完整遍历训练集；DataLoader 默认保留最后一个不满的 batch。
+    step = 0
+    for epoch in range(1, args.epochs + 1):
+        epoch_loss_sum = 0.0
+        epoch_samples = 0
+        running_loss_sum = 0.0
+        running_samples = 0
+        for batch_index, (clean, labels) in enumerate(loader, start=1):
+            step += 1
+            clean = clean.to(device)
+            noise = torch.randn_like(clean)
+            t = torch.randn(len(clean), device=device).sigmoid()  # logit-normal 时间采样
+            noisy_latent, target_velocity = flow_training_pair(clean, noise, t)
 
-        optimizer.zero_grad(set_to_none=True)
-        context = torch.autocast("cuda", dtype=torch.bfloat16) if args.precision == "bf16" else nullcontext()
-        with context:
-            predicted_velocity = model(noisy_latent, t, text, text_mask)
-            loss = F.mse_loss(predicted_velocity.float(), target_velocity.float())
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, error_if_nonfinite=True)
-        optimizer.step()
-        running_loss += loss.item()
+            # 一部分样本使用空文本，让模型同时学习无条件预测，推理时才能做 CFG。
+            drop = torch.rand(len(clean)) < args.cond_drop
+            condition_indices = labels.masked_fill(drop, null_index)
+            text = text_bank[condition_indices].to(device)
+            text_mask = mask_bank[condition_indices].to(device)
 
-        if step % args.log_every == 0:
-            print(f"step {step}/{args.steps}  train_loss={running_loss / args.log_every:.6f}", flush=True)
-            running_loss = 0.0
-        if step % args.save_every == 0 or step == args.steps:
+            optimizer.zero_grad(set_to_none=True)
+            context = torch.autocast("cuda", dtype=torch.bfloat16) if args.precision == "bf16" else nullcontext()
+            with context:
+                predicted_velocity = model(noisy_latent, t, text, text_mask)
+                loss = F.mse_loss(predicted_velocity.float(), target_velocity.float())
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, error_if_nonfinite=True)
+            optimizer.step()
+            batch_samples = len(clean)
+            loss_value = loss.item()
+            epoch_loss_sum += loss_value * batch_samples
+            epoch_samples += batch_samples
+            running_loss_sum += loss_value * batch_samples
+            running_samples += batch_samples
+
+            if step % args.log_every == 0 or batch_index == steps_per_epoch:
+                print(f"epoch {epoch}/{args.epochs}  batch {batch_index}/{steps_per_epoch}  "
+                      f"step {step}/{total_steps}  "
+                      f"train_loss={running_loss_sum / running_samples:.6f}", flush=True)
+                running_loss_sum = 0.0
+                running_samples = 0
+
+        epoch_train_loss = epoch_loss_sum / epoch_samples
+        print(f"Completed epoch {epoch}/{args.epochs}; "
+              f"train_loss={epoch_train_loss:.6f}", flush=True)
+        if epoch % args.save_every_epochs == 0 or epoch == args.epochs:
             val_loss = validation_loss(model, val_latents, val_labels, text_bank, mask_bank,
                                        args.batch_size, device)
             # 教学版本仅保存推理所需状态，不保存 optimizer/RNG；不支持断点续训。
             checkpoint = {"model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
                           "dit_config": asdict(config), "train_args": vars(args),
-                          "step": step, "val_loss": val_loss}
+                          "epoch": epoch, "step": step, "steps_per_epoch": steps_per_epoch,
+                          "train_loss": epoch_train_loss, "val_loss": val_loss}
             if args.data_dir:
                 checkpoint["example_prompts"] = list(dict.fromkeys(train_data.captions))[:4]
             temporary = output / "checkpoint.tmp"
             torch.save(checkpoint, temporary)
             temporary.replace(output / "last.pt")
             with (output / "metrics.jsonl").open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps({"step": step, "train_loss": loss.item(), "val_loss": val_loss}) + "\n")
-            print(f"Saved step {step}; validation velocity MSE={val_loss:.6f}", flush=True)
+                stream.write(json.dumps({"epoch": epoch, "step": step,
+                                         "train_loss": epoch_train_loss,
+                                         "val_loss": val_loss}) + "\n")
+            print(f"Saved epoch {epoch}, step {step}; "
+                  f"validation velocity MSE={val_loss:.6f}", flush=True)
 
 
 if __name__ == "__main__":
