@@ -127,7 +127,7 @@ CUDA_VISIBLE_DEVICES=0 python train.py --data-dir data/my-images --output runs/m
 
 训练通过 `--epochs` 设置完整遍历训练集的轮数，默认 40 轮。每轮重新打乱顺序，并保留最后不足一个 batch 的图片；每轮步数为 `ceil(训练集图片数 / batch_size)`，总步数为 `epochs × 每轮步数`。默认轮数只是起点，不保证收敛，应结合验证损失和生成效果调整。
 
-`--save-every-epochs` 默认 1，即每轮结束后验证并更新 `last.pt`；最后一轮始终验证并保存。`--log-every` 仍按参数更新步数计数，默认 50，且每轮末尾会打印日志。日志同时显示 epoch、当前轮 batch 和累计 step，保存的训练损失是按样本数加权的整轮均值。训练参数 `--steps` 和 `--save-every` 已移除，请分别改用 `--epochs` 和 `--save-every-epochs`；`eval.py --steps` 仍表示生成采样步数。
+每轮结束后都会验证，并将 epoch、累计 step、整轮训练损失和验证损失追加到 `metrics.jsonl`，与权重保存频率无关。`--save-every-epochs` 默认 0，表示只在最后一轮保存 `last.pt`；设为正整数 N 可每 N 轮覆盖保存同一个 `last.pt`，最后一轮始终保存，不会保留各轮的权重副本。只在最后保存时，提前中断不会产生本次训练的权重，但已完成轮次的日志会保留。`--log-every` 仍按参数更新步数计数，默认 50，且每轮末尾会打印日志。日志同时显示 epoch、当前轮 batch 和累计 step，保存的训练损失是按样本数加权的整轮均值。训练参数 `--steps` 和 `--save-every` 已移除，请分别改用 `--epochs` 和 `--save-every-epochs`；`eval.py --steps` 仍表示生成采样步数。
 
 例如训练宠物图片 50 轮（轮数可自行调整）：
 
@@ -138,7 +138,7 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
   --batch-size 16 \
   --encode-batch-size 8 \
   --epochs 50 \
-  --save-every-epochs 1 \
+  --save-every-epochs 0 \
   --output runs/pets-epochs-v1
 ```
 
@@ -196,11 +196,11 @@ CUDA_VISIBLE_DEVICES=6 python train.py --samples 4096 --epochs 40 --output runs/
 runs/shapes/
   config.json                  训练配置
   vae-reconstruction.png       验证集原图/重建对照
-  metrics.jsonl                保存时的 epoch、step、整轮 train/val velocity MSE
+  metrics.jsonl                每轮的 epoch、step、整轮 train/val velocity MSE
   last.pt                      最近一次保存的 DiT 权重、配置、训练轮数和步数
 ```
 
-`last.pt` 在每次保存时更新；尚未实现 optimizer/RNG 保存、断点续训、EMA、学习率调度或分布式训练。重新运行训练必须用新输出目录。这些功能可在核心流程理解后加入。
+`last.pt` 默认仅在训练完成时生成；开启定期保存时覆盖更新同一个文件；尚未实现 optimizer/RNG 保存、断点续训、EMA、学习率调度或分布式训练。重新运行训练必须用新输出目录。这些功能可在核心流程理解后加入。
 
 4. 固定同一初始噪声，对比改变颜色/形状/位置后的生成结果。
 
