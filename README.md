@@ -125,6 +125,23 @@ python dataset.py --data-dir data/my-images --output outputs/my-data-preview.png
 CUDA_VISIBLE_DEVICES=0 python train.py --data-dir data/my-images --output runs/my-images-v1
 ```
 
+训练通过 `--epochs` 设置完整遍历训练集的轮数，默认 40 轮。每轮重新打乱顺序，并保留最后不足一个 batch 的图片；每轮步数为 `ceil(训练集图片数 / batch_size)`，总步数为 `epochs × 每轮步数`。默认轮数只是起点，不保证收敛，应结合验证损失和生成效果调整。
+
+`--save-every-epochs` 默认 1，即每轮结束后验证并更新 `last.pt`；最后一轮始终验证并保存。`--log-every` 仍按参数更新步数计数，默认 50，且每轮末尾会打印日志。日志同时显示 epoch、当前轮 batch 和累计 step，保存的训练损失是按样本数加权的整轮均值。训练参数 `--steps` 和 `--save-every` 已移除，请分别改用 `--epochs` 和 `--save-every-epochs`；`eval.py --steps` 仍表示生成采样步数。
+
+例如训练宠物图片 50 轮（轮数可自行调整）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train.py \
+  --data-dir data/oxford-pets/images \
+  --image-size 128 \
+  --batch-size 16 \
+  --encode-batch-size 8 \
+  --epochs 50 \
+  --save-every-epochs 1 \
+  --output runs/pets-epochs-v1
+```
+
 至少需要 2 张图片。默认按文件随机留出约 10% 验证，保证训练和验证各至少一张；通过 `--val-ratio 0.1`、`--seed 42` 控制。在文件集合与名称不变时，同一 seed 的划分保持一致。训练/验证共用提示词索引，但不共用文件；不同文件保存了同一张图片的情况不会自动检测，应自行去重。同一提示词可能出现在两个集合，这不代表未见提示词泛化测试。实际划分写入输出目录的 `dataset-split.json`。
 
 指定 `--data-dir` 时读取目录内所有支持的图片，`--samples` / `--val-samples` 仅用于原来的合成数据。`--image-size` 同时控制训练和预览分辨率；默认 VAE 与 patch-size 要求训练分辨率能被 16 整除。每次启动仍需使用新的输出目录，不支持断点续训。
@@ -154,10 +171,10 @@ python dataset.py --output outputs/data-preview.png
 2. 用 8 张图做过拟合学习实验。
 
 ```bash
-CUDA_VISIBLE_DEVICES=6 python train.py --samples 8 --val-samples 16 --batch-size 8 --steps 1000 --save-every 250 --cond-drop 0 --output runs/overfit
+CUDA_VISIBLE_DEVICES=6 python train.py --samples 8 --val-samples 16 --batch-size 8 --epochs 1000 --save-every-epochs 250 --cond-drop 0 --output runs/overfit
 ```
 
-目的只是先看少量样本上的 loss 是否下降，1000 步不是保证收敛的承诺。查看 `vae-reconstruction.png` 中相邻的原图/重建图，先了解 VAE 本身的重建误差。过拟合实验只见过少数 caption，生成时应使用这些训练 caption；可用下面的 CPU 命令列出：
+此例每轮只有一个 batch，1000 epochs 对应 1000 次参数更新。目的只是先看少量样本上的 loss 是否下降，不保证收敛。查看 `vae-reconstruction.png` 中相邻的原图/重建图，先了解 VAE 本身的重建误差。过拟合实验只见过少数 caption，生成时应使用这些训练 caption；可用下面的 CPU 命令列出：
 
 ```bash
 python -c 'from dataset import ShapesDataset; d=ShapesDataset(count=8); print("\n".join(d[i]["caption"] for i in range(8)))'
@@ -168,7 +185,7 @@ python -c 'from dataset import ShapesDataset; d=ShapesDataset(count=8); print("\
 3. 训练更完整的形状数据。
 
 ```bash
-CUDA_VISIBLE_DEVICES=6 python train.py --samples 4096 --steps 10000 --output runs/shapes
+CUDA_VISIBLE_DEVICES=6 python train.py --samples 4096 --epochs 40 --output runs/shapes
 ```
 
 默认 batch=16、hidden=256、depth=6、head=8，全部 FP32。支持 BF16 的 NVIDIA 卡可加 `--precision bf16`；先保持默认值便于阅读与定位问题。如果显存不够，分别降低 `--batch-size`（DiT 训练）和 `--encode-batch-size`（VAE 编码）。不承诺具体显存或耗时，尚未实测。
@@ -179,8 +196,8 @@ CUDA_VISIBLE_DEVICES=6 python train.py --samples 4096 --steps 10000 --output run
 runs/shapes/
   config.json                  训练配置
   vae-reconstruction.png       验证集原图/重建对照
-  metrics.jsonl                checkpoint 时的 train/val velocity MSE
-  last.pt                      最近一次保存的 DiT 权重、配置、训练步数
+  metrics.jsonl                保存时的 epoch、step、整轮 train/val velocity MSE
+  last.pt                      最近一次保存的 DiT 权重、配置、训练轮数和步数
 ```
 
 `last.pt` 在每次保存时更新；尚未实现 optimizer/RNG 保存、断点续训、EMA、学习率调度或分布式训练。重新运行训练必须用新输出目录。这些功能可在核心流程理解后加入。
