@@ -69,7 +69,7 @@ def main():
     parser.add_argument("--patch-size", type=int, default=2)
     parser.add_argument("--cond-drop", type=float, default=0.1)
     parser.add_argument("--precision", choices=["fp32", "bf16"], default="fp32")
-    parser.add_argument("--save-every-epochs", type=int, default=1, help="Validate and save every N epochs; always save the final epoch")
+    parser.add_argument("--save-every-epochs", type=int, default=0, help="Save weights every N epochs; 0 saves only the final epoch. Validation/logging runs every epoch")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--clip-model", default=DEFAULT_CLIP)
@@ -78,10 +78,12 @@ def main():
     parser.add_argument("--vae-revision", default=None)
     args = parser.parse_args()
     positive = (args.samples, args.val_samples, args.batch_size, args.encode_batch_size,
-                args.epochs, args.save_every_epochs, args.log_every, args.image_size,
+                args.epochs, args.log_every, args.image_size,
                 args.hidden_size, args.depth, args.heads, args.patch_size)
     if min(positive) <= 0 or args.lr <= 0 or not 0 <= args.cond_drop < 1:
         parser.error("Counts/lr must be positive, and cond-drop must be in [0, 1)")
+    if args.save_every_epochs < 0:
+        parser.error("save-every-epochs must be nonnegative; 0 saves only the final epoch")
     if args.image_size < 32 or args.hidden_size % 4 or args.hidden_size % args.heads:
         parser.error("image-size >= 32; hidden-size must divide by 4 and heads")
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -205,11 +207,19 @@ def main():
                 running_samples = 0
 
         epoch_train_loss = epoch_loss_sum / epoch_samples
+        # 每轮验证与日志独立于权重保存频率。
+        val_loss = validation_loss(model, val_latents, val_labels, text_bank, mask_bank,
+                                   args.batch_size, device)
+        with (output / "metrics.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"epoch": epoch, "step": step,
+                                     "train_loss": epoch_train_loss,
+                                     "val_loss": val_loss}) + "\n")
         print(f"Completed epoch {epoch}/{args.epochs}; "
-              f"train_loss={epoch_train_loss:.6f}", flush=True)
-        if epoch % args.save_every_epochs == 0 or epoch == args.epochs:
-            val_loss = validation_loss(model, val_latents, val_labels, text_bank, mask_bank,
-                                       args.batch_size, device)
+              f"train_loss={epoch_train_loss:.6f}; "
+              f"validation velocity MSE={val_loss:.6f}", flush=True)
+        save_weights = epoch == args.epochs or (
+            args.save_every_epochs > 0 and epoch % args.save_every_epochs == 0)
+        if save_weights:
             # 教学版本仅保存推理所需状态，不保存 optimizer/RNG；不支持断点续训。
             checkpoint = {"model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
                           "dit_config": asdict(config), "train_args": vars(args),
@@ -220,10 +230,6 @@ def main():
             temporary = output / "checkpoint.tmp"
             torch.save(checkpoint, temporary)
             temporary.replace(output / "last.pt")
-            with (output / "metrics.jsonl").open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps({"epoch": epoch, "step": step,
-                                         "train_loss": epoch_train_loss,
-                                         "val_loss": val_loss}) + "\n")
             print(f"Saved epoch {epoch}, step {step}; "
                   f"validation velocity MSE={val_loss:.6f}", flush=True)
 
