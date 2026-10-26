@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from clip import DEFAULT_CLIP, FrozenCLIP
-from dataset import ShapesDataset, save_grid
+from dataset import ShapesDataset, load_image_datasets, save_grid
 from dit import DiTConfig, TinyDiT
 from flow import flow_training_pair
 from vae import DEFAULT_VAE, FrozenVAE
@@ -40,11 +40,11 @@ def validation_loss(model, latents, labels, text_bank, mask_bank, batch_size, de
     total_loss = 0.0
     for start in range(0, len(latents), batch_size):
         clean = latents[start:start + batch_size].to(device)
-        indices = labels[start:start + batch_size].to(device)
+        indices = labels[start:start + batch_size]
         noise = torch.randn(clean.shape, generator=generator).to(device)
         t = torch.randn(clean.shape[0], generator=generator).sigmoid().to(device)
         mixed, target = flow_training_pair(clean, noise, t)
-        predicted = model(mixed, t, text_bank[indices], mask_bank[indices])
+        predicted = model(mixed, t, text_bank[indices].to(device), mask_bank[indices].to(device))
         total_loss += F.mse_loss(predicted.float(), target.float()).item() * len(clean)
     model.train()
     return total_loss / len(latents)
@@ -55,8 +55,10 @@ def main():
     parser.add_argument("--output", default="runs/shapes")
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--image-size", type=int, default=128)
-    parser.add_argument("--samples", type=int, default=4096)
-    parser.add_argument("--val-samples", type=int, default=128)
+    parser.add_argument("--data-dir", help="Image folder; omit to use synthetic shapes")
+    parser.add_argument("--val-ratio", type=float, default=0.1, help="Validation fraction for --data-dir")
+    parser.add_argument("--samples", type=int, default=4096, help="Synthetic shapes only")
+    parser.add_argument("--val-samples", type=int, default=128, help="Synthetic shapes only")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--encode-batch-size", type=int, default=8)
     parser.add_argument("--steps", type=int, default=10000)
@@ -86,6 +88,15 @@ def main():
         parser.error("CUDA unavailable; use a GPU server or explicitly select --device cpu")
     if args.precision == "bf16" and (args.device != "cuda" or not torch.cuda.is_bf16_supported()):
         parser.error("This example enables bf16 only on supported CUDA GPUs")
+    if args.data_dir:
+        try:
+            train_data, val_data = load_image_datasets(
+                args.data_dir, args.image_size, args.seed, args.val_ratio)
+        except ValueError as error:
+            parser.error(str(error))
+    else:
+        train_data = ShapesDataset(args.samples, args.image_size, args.seed, "train")
+        val_data = ShapesDataset(args.val_samples, args.image_size, args.seed, "val")
     output = Path(args.output)
     if output.exists() and any(output.iterdir()):
         parser.error("Use a new output directory; this minimal trainer does not resume old runs")
@@ -94,8 +105,16 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    train_data = ShapesDataset(args.samples, args.image_size, args.seed, "train")
-    val_data = ShapesDataset(args.val_samples, args.image_size, args.seed, "val")
+    if args.data_dir:
+        root = Path(args.data_dir).expanduser().resolve()
+        manifest = {data.split: [
+            {"file": str(path.relative_to(root)), "caption": caption, "label": label}
+            for path, caption, label in zip(data.paths, data.captions, data.labels)]
+            for data in (train_data, val_data)}
+        (output / "dataset-split.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Dataset: train={len(train_data)}, val={len(val_data)}, "
+          f"unique captions={len(train_data.caption_bank)}", flush=True)
 
     # 1. 冻结 VAE，把训练/验证图像变成 latent；此阶段还没有训练 DiT。
     vae = FrozenVAE(args.vae_model, args.vae_revision).to(device)
@@ -112,7 +131,7 @@ def main():
     save_grid(torch.stack([originals, reconstructed], dim=1).flatten(0, 1), output / "vae-reconstruction.png")
     del vae
 
-    # 2. 只有 108 种 caption，加一个空提示词。一次编码后缓存 token 特征。
+    # 2. 所有不同 caption 加一个空提示词，缓存到 CPU；每步只上传当前 batch。
     encoder = FrozenCLIP(args.clip_model, args.clip_revision).to(device)
     text_dim = encoder.hidden_size
     captions = train_data.caption_bank + [""]
@@ -120,8 +139,8 @@ def main():
     features, masks = [], []
     for start in range(0, len(captions), 32):
         text, mask = encoder(captions[start:start + 32])
-        features.append(text)
-        masks.append(mask)
+        features.append(text.cpu())
+        masks.append(mask.cpu())
     text_bank, mask_bank = torch.cat(features), torch.cat(masks)
     del encoder, features, masks, text, mask
     if device.type == "cuda":
@@ -147,15 +166,16 @@ def main():
         except StopIteration:
             iterator = iter(loader)
             clean, labels = next(iterator)
-        clean, labels = clean.to(device), labels.to(device)
+        clean = clean.to(device)
         noise = torch.randn_like(clean)
         t = torch.randn(len(clean), device=device).sigmoid()  # logit-normal 时间采样
         noisy_latent, target_velocity = flow_training_pair(clean, noise, t)
 
         # 一部分样本使用空文本，让模型同时学习无条件预测，推理时才能做 CFG。
-        drop = torch.rand(len(clean), device=device) < args.cond_drop
+        drop = torch.rand(len(clean)) < args.cond_drop
         condition_indices = labels.masked_fill(drop, null_index)
-        text, text_mask = text_bank[condition_indices], mask_bank[condition_indices]
+        text = text_bank[condition_indices].to(device)
+        text_mask = mask_bank[condition_indices].to(device)
 
         optimizer.zero_grad(set_to_none=True)
         context = torch.autocast("cuda", dtype=torch.bfloat16) if args.precision == "bf16" else nullcontext()
@@ -177,6 +197,8 @@ def main():
             checkpoint = {"model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
                           "dit_config": asdict(config), "train_args": vars(args),
                           "step": step, "val_loss": val_loss}
+            if args.data_dir:
+                checkpoint["example_prompts"] = list(dict.fromkeys(train_data.captions))[:4]
             temporary = output / "checkpoint.tmp"
             torch.save(checkpoint, temporary)
             temporary.replace(output / "last.pt")

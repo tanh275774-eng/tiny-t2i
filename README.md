@@ -1,6 +1,6 @@
 # 手写一个小型文本生成图片模型
 
-这是用于学习训练流程的项目：冻结预训练 CLIP 和 VAE，从零训练自己定义的小型 DiT，生成 128×128 的彩色几何图形。
+这是用于学习训练流程的项目：冻结预训练 CLIP 和 VAE，从零训练自己定义的小型 DiT。可以使用合成彩色几何图形，也可以读取自己的图片文件夹，把文件名作为提示词；默认分辨率为 128×128。
 
 代码没有调用文生图 Pipeline。DiT 网络、条件注入、Flow Matching 目标、反向传播和 Euler 采样都在本目录显式定义。它不是 Qwen-Image 的复现，也没有通用照片生成能力。
 
@@ -10,7 +10,7 @@
 
 | 文件 | 内容 |
 | --- | --- |
-| `dataset.py` | 自动生成配对图片和英文描述，支持数据预览 |
+| `dataset.py` | 加载以提示词命名的图片，或生成合成形状；支持数据预览 |
 | `clip.py` | 冻结 CLIP 文本编码器，提取完整 token 序列与 padding mask |
 | `vae.py` | 冻结 VAE，显式处理后验分布、latent 缩放和图像范围 |
 | `dit.py` | 自己定义 patch embedding、位置编码、时间嵌入、attention、MLP 和输出层 |
@@ -92,6 +92,48 @@ python -m pip install -r requirements.txt
 默认加载 `openai/clip-vit-base-patch32` 和 `stabilityai/sd-vae-ft-mse`。首次需要网络下载；可通过 `--clip-model /path/to/clip`、`--vae-model /path/to/vae` 指定本地模型目录。`HF_HOME` 可以指定允许写入的缓存盘。参数 `--clip-revision` 和 `--vae-revision` 可固定仓库 commit；没有指定时不保证未来从同名仓库拿到的文件永远一致。
 
 CLIP 此处只使用文本编码器，不需要 CLIP 图像编码器。为匹配这个英文 CLIP 与合成标签，先用英文提示词。
+
+## 使用自己的图片数据集
+
+把提示词直接用作图片文件名，例如：
+
+```text
+data/my-images/
+  a red car parked on a street.jpg
+  a black cat sitting on a sofa.png
+  group-2/
+    a white dog running on grass.jpeg
+```
+
+支持 JPG、JPEG、PNG、WebP、BMP、TIF、TIFF，扩展名不区分大小写，会递归读取子文件夹。隐藏文件和隐藏文件夹会跳过。`a red car parked on a street.jpg` 对应提示词 `a red car parked on a street`：只去掉最后一个扩展名和首尾空白，不会自动去掉编号、把下划线变为空格，或加入父目录名。同一提示词的多张图片可以放在不同子文件夹下，保持同名。建议直接使用带空格的简短英文文件名；中文文件名可以读取，但当前英文 CLIP 不适合以中文效果为目标，超过 77 token 的文本会截断。
+
+加载时先处理 EXIF 方向，透明部分合成到白底，转换为 RGB，再等比例缩放、居中补白到正方形。默认返回 `image: [3,128,128]`、范围 `[-1,1]`，以及字符串 `caption` 和整数 `label`。`label` 只是该提示词在文本缓存中的索引，不是物体类别。没有随机裁剪或翻转，以免图片与文件名描述不一致。多帧文件只读取首帧；损坏的图片会报告路径并停止。
+
+先预览前 16 张图片及对应提示词：
+
+```bash
+python dataset.py --data-dir data/my-images --output outputs/my-data-preview.png
+```
+
+开始训练（GPU 0 替换为你实际可用的卡）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train.py --data-dir data/my-images --output runs/my-images-v1
+```
+
+至少需要 2 张图片。默认按文件随机留出约 10% 验证，保证训练和验证各至少一张；通过 `--val-ratio 0.1`、`--seed 42` 控制。在文件集合与名称不变时，同一 seed 的划分保持一致。训练/验证共用提示词索引，但不共用文件；不同文件保存了同一张图片的情况不会自动检测，应自行去重。同一提示词可能出现在两个集合，这不代表未见提示词泛化测试。实际划分写入输出目录的 `dataset-split.json`。
+
+指定 `--data-dir` 时读取目录内所有支持的图片，`--samples` / `--val-samples` 仅用于原来的合成数据。`--image-size` 同时控制训练和预览分辨率；默认 VAE 与 patch-size 要求训练分辨率能被 16 整除。每次启动仍需使用新的输出目录，不支持断点续训。
+
+图片 latent 和全部不同提示词的 CLIP 特征缓存在 **CPU 内存**，只把当前 batch 搬到 GPU。默认 CLIP 每条不同提示词约占 154 KiB 特征缓存，1 万条约 1.47 GiB，构建缓存时还会有额外临时内存；这里仍是小中型数据集的教学实现，没有磁盘缓存或流式加载。`data/` 已加入 `.gitignore`，避免误提交数据。
+
+生成时指定自己的提示词：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python eval.py --checkpoint runs/my-images-v1/last.pt --prompt 'a black cat sitting on a sofa' --output outputs/my-cat.png
+```
+
+这类新 checkpoint 不传 `--prompt` 时，默认使用保存的至多 4 条训练集提示词；原来形状模型的默认提示词保持不变。更换数据不会自动让小型随机初始化 DiT 获得通用照片生成能力，先用主题较集中、描述准确的数据观察学习情况。
 
 ## 以后有空闲 GPU 时的操作顺序
 

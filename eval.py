@@ -48,7 +48,7 @@ def main():
     model = TinyDiT(config)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device).eval()
-    prompts = args.prompt or DEFAULT_PROMPTS
+    prompts = args.prompt or checkpoint.get("example_prompts") or DEFAULT_PROMPTS
 
     encoder = FrozenCLIP(trained["clip_model"], trained["clip_revision"]).to(device)
     text, text_mask = encoder(prompts)
